@@ -75,7 +75,7 @@ class GRUCompat(tf.keras.layers.GRU):
 
 # --- 2. Feature Definition ---
 SELECTED_FEATURES = [
-    'AC', 'CA199', 'PLR', 'Tumor differentiation', 'Age', 'GGT',
+    'CA199', 'PLR', 'Tumor differentiation', 'Age', 'GGT',
     'BMI', 'CEA', 'ALT', 'Peroperative bleeding', 'NLR', 'TBIL',
     'Tumor number', 'Lymph node dissection', 'Hepatocirrhosis',
     'ALB', 'Nerve invasion', 'PT', 'Tumor size', 'MVI', 'AJCC stage',
@@ -84,13 +84,15 @@ SELECTED_FEATURES = [
     'Cardiopulmonary disease', 'Surgical type', 'Hepatitis'
 ]
 
-# Feature subset for traditional ML models (17 features)
+MODEL_FEATURES = SELECTED_FEATURES + ['AC']
+
 TRADITIONAL_FEATURES = [
-    'AC', 'CA199', 'PLR', 'Tumor differentiation', 'Age', 'GGT', 
-    'BMI', 'CEA', 'ALT', 'Peroperative bleeding', 'NLR', 'TBIL', 
-    'Tumor number', 'Lymph node dissection', 'Hepatocirrhosis', 
+    'CA199', 'PLR', 'Tumor differentiation', 'Age', 'GGT',
+    'BMI', 'CEA', 'ALT', 'Peroperative bleeding', 'NLR', 'TBIL',
+    'Tumor number', 'Lymph node dissection', 'Hepatocirrhosis',
     'ALB', 'Nerve invasion'
 ]
+TRADITIONAL_MODEL_FEATURES = TRADITIONAL_FEATURES + ['AC']
 
 # --- 3. Load Data and Scaler (Cached) ---
 @st.cache_resource
@@ -108,12 +110,13 @@ def load_data_and_scaler():
     
     # Preprocessing logic reuses parts of 1.py
     # 1.py merges then processes, here simplified: read and process numerical columns directly
-    # Ensure columns exist
-    available_features = [f for f in SELECTED_FEATURES if f in df_train.columns]
-    if len(available_features) < len(SELECTED_FEATURES):
-        missing = set(SELECTED_FEATURES) - set(available_features)
+    # Ensure columns exist. Fit scaler on MODEL_FEATURES (31 features incl. AC) so
+    # internal model input matches what the trained models expect.
+    available_features = [f for f in MODEL_FEATURES if f in df_train.columns]
+    if len(available_features) < len(MODEL_FEATURES):
+        missing = set(MODEL_FEATURES) - set(available_features)
         st.warning(f"Missing features in training data: {missing}")
-    
+
     X_df = df_train[available_features].apply(pd.to_numeric, errors='coerce')
     
     # Calculate means for filling missing values
@@ -335,10 +338,10 @@ def main():
         
         # 特征默认值设置为0的列表
         ZERO_DEFAULT_FEATURES = [
-            'Gender', 'Hepatitis', 'Hepatocirrhosis', 'Hepatobiliary disease', 
-            'Cardiopulmonary disease', 'Surgical type', 'Lymph node dissection', 
-            'Extent of liver resection', 'AC', 'AFP', 'CEA', 'CA199', 
-            'Tumor differentiation', 'MVI', 'Nerve invasion', 
+            'Gender', 'Hepatitis', 'Hepatocirrhosis', 'Hepatobiliary disease',
+            'Cardiopulmonary disease', 'Surgical type', 'Lymph node dissection',
+            'Extent of liver resection', 'AFP', 'CEA', 'CA199',
+            'Tumor differentiation', 'MVI', 'Nerve invasion',
             'Liver caosule invasion', 'Tumor number', 'Tumor size'
         ]
 
@@ -364,14 +367,29 @@ def main():
 
     if submitted:
         # 1. 数据预处理
-        input_data = pd.DataFrame([user_inputs])
-        input_data = input_data[SELECTED_FEATURES]
-        X_scaled = scaler.transform(input_data)
-        X_scaled_df = pd.DataFrame(X_scaled, columns=SELECTED_FEATURES)
-        
+        # Build a 30-col user input frame (no AC) then immediately pad AC with
+        # the training-set mean so the scaler (fit on 31 cols) sees the same
+        # columns it was trained on.
+        user_only_df = pd.DataFrame([user_inputs])[SELECTED_FEATURES]
+
+        ac_default = float(means['AC']) if 'AC' in means.index else 0.0
+        full_input_df = user_only_df.copy()
+        full_input_df['AC'] = ac_default
+        full_input_df = full_input_df[MODEL_FEATURES]  # 31 cols, exact scaler order
+
+        X_scaled_full = scaler.transform(full_input_df)
+        X_scaled_df = pd.DataFrame(X_scaled_full, columns=MODEL_FEATURES)
+
+        # UI-facing 30-dim scaled slice (no AC) for downstream statistics / plots
+        X_scaled = X_scaled_df[SELECTED_FEATURES].values
+
+        # Internal model-facing features
+        X_full = X_scaled_df[MODEL_FEATURES].values        # (1, 31) for DL models
+        X_trad = X_scaled_df[TRADITIONAL_MODEL_FEATURES].values  # (1, 17) for trad ML
+
         # 2. 模型预测
         results = []
-        
+
         # 预先计算 Transformer_MLP 的基线生存
         baseline_df = None
         if 'Transformer_MLP' in models:
@@ -387,10 +405,10 @@ def main():
 
         for name in sorted_model_names:
             model = models[name]
-            
+
             # --- 传统机器学习模型处理 ---
             if name in trad_models:
-                X_in = X_scaled_df[TRADITIONAL_FEATURES].values
+                X_in = X_trad
                 try:
                     if hasattr(model, "predict_proba"):
                         pred = model.predict_proba(X_in)[:, 1][0]
@@ -412,9 +430,9 @@ def main():
                 continue
 
             # --- 深度学习模型处理 ---
-            X_in = X_scaled
+            X_in = X_full
             if hasattr(model, 'input_shape') and len(model.input_shape) == 3:
-                 X_in = np.expand_dims(X_scaled, axis=1)
+                 X_in = np.expand_dims(X_full, axis=1)
             
             pred = model.predict(X_in, verbose=0).flatten()[0]
             
@@ -532,7 +550,7 @@ def main():
             st.markdown("Shows the deviation of patient feature values from the training set mean (in standard deviations).")
             
             # 计算 Z-scores (即 X_scaled)
-            # 选取传统模型使用的17个重要特征进行展示，避免过多
+            # 选取传统模型使用的重要特征进行展示，避免过多
             feat_subset = TRADITIONAL_FEATURES
             # 找到这些特征在 SELECTED_FEATURES 中的索引
             indices = [SELECTED_FEATURES.index(f) for f in feat_subset]
